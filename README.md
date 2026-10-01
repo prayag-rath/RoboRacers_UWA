@@ -23,7 +23,7 @@ Devices in use:
 7) Reciever : Traxxas Micro Reciever 2216 27 MHz AM
 8) Battery : 6S 7.2V 2000mAh NiCd 
 
-Servo PinOut:
-brown - GND ; red - Motor Signal ; orange - Servo
+Pinout car: 
+  brown - GND ; red - Motor Signal - GPIO 26 ; orange - Servo - GPIO 19
 
 
