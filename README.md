@@ -24,8 +24,6 @@ Devices in use:
 8) Battery : 6S 7.2V 2000mAh NiCd 
 
 Servo PinOut:
-brown - GND
-red - Motor Signal
-orange - Servo
+brown - GND ; red - Motor Signal ; orange - Servo
 
 
