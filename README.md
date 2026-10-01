@@ -14,5 +14,5 @@ passwords:
 4) sudo pi : rasp
 
 Devices in use:
-Lidar in : https://docs.fictionlab.pl/integrations/lidars/hokuyo-ug-04lx-ug01
-Raspberry Pi : https://pip.raspberrypi.com/documents/RP-008341-DS-raspberry-pi-4-datasheet.pdf
+1) Lidar in : https://docs.fictionlab.pl/integrations/lidars/hokuyo-ug-04lx-ug01
+2) Raspberry Pi : https://pip.raspberrypi.com/documents/RP-008341-DS-raspberry-pi-4-datasheet.pdf
