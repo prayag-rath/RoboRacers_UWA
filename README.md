@@ -21,7 +21,8 @@ Devices in use:
 5) ESC : Traxxas XL5 EZ-SET
 6) Servo : Traxxas waterproof 2056
 7) Reciever : Traxxas Micro Reciever 2216 27 MHz AM
-8) Battery : 6S 7.2V 2000mAh NiCd 
+8) Battery : 6S 7.2V 2000mAh NiCd
+9) Motor : Titan 12T550
 
 Pinout car: 
   brown - GND ; red - Motor Signal - GPIO 26 ; orange - Servo - GPIO 19
