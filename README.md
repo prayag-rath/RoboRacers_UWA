@@ -14,17 +14,19 @@ passwords:
 4) User pi : rasp
 
 Devices in use:
-1) Lidar in : https://docs.fictionlab.pl/integrations/lidars/hokuyo-ug-04lx-ug01
-2) Raspberry Pi : https://pip.raspberrypi.com/documents/RP-008341-DS-raspberry-pi-4-datasheet.pdf
+1) Lidar : Hokuyo URG-04LX-UG01
+   https://docs.fictionlab.pl/integrations/lidars/hokuyo-ug-04lx-ug01
+2) Controller : Raspberry Pi 4B
+   https://pip.raspberrypi.com/documents/RP-008341-DS-raspberry-pi-4-datasheet.pdf
 3) Camera : Arducam UC-350 Rev. B
 4) TouchScreen : SpotPear RPi LCD (A) V3 3.5"
 5) ESC : Traxxas XL5 EZ-SET
 6) Servo : Traxxas waterproof 2056
-7) Reciever : Traxxas Micro Reciever 2216 27 MHz AM
+7) Reciever : Traxxas Micro Reciever 2216 27 MHz AM (Only used as power distributor)
 8) Battery : 6S 7.2V 2000mAh NiCd
 9) Motor : Titan 12T550
 
 Pinout car: 
-  brown - GND ; red - Motor Signal - GPIO 26 ; orange - Servo - GPIO 19
+  brown - GND ; red - Motor Signal - GPIO 12 ; orange - Servo - GPIO 19
 
 
