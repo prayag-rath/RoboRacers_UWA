@@ -1,15 +1,15 @@
 """lidar.py - Hokuyo URG-04LX-UG01 reader (own thread). Started by main.py.
 
-The sensor is fixed at 10 scans/s and 0.3516 deg per step, only the window,
-cluster and filters below can be set.
+The sensor is fixed at 10 scans/s and 0.3516 deg per step, only the settings below can be changed.
 
 Everything the other files need is in `state` plus a few helpers:
     state["points"]  [(angle_deg, range_mm), ...]   angle 0 = ahead, + = left, range 0 = invalid
+    state["planes"]  straight walls / object sides found in the scan:
+                     [{"a": (x, y), "b": (x, y), "dist": mm, "angle": deg, "n": points}, ...]
+                     x = ahead, y = left (mm). a, b = the two ends, dist = from the lidar to the plane,
+                     angle = direction of the plane, 0 = along the car, +-90 = across
     fresh()          True while scans keep arriving
-    state["lines"]   the scan joined into lines: [{"verts": [(angle_deg, range_mm, x_mm, y_mm), ...], "n": points}, ...]
-                     x = ahead, y = left. Points that are close together become one polyline
     nearest(lo, hi)  closest valid point between two angles -> (range_mm, angle_deg) or None
-    edges()          angles of the first and last step of the scan window
 
 Standalone check:  python3 lidar.py [/dev/ttyACM1]     (prints the closest point)
 Needs pyserial:    sudo apt install python3-serial
@@ -29,31 +29,34 @@ except ImportError:
 PORT = "/dev/ttyACM0"
 BAUD = 115200          # ignored over usb
 TIMEOUT_S = 1.0        # serial read timeout
-
-START_STEP = 44        # first step of the scan (44 = about -120 deg, right side)
-END_STEP = 725         # last step (725 = about +120 deg, left side)
-CLUSTER = 1            # merge N neighbouring steps into one point, 1 = off
-
-MIN_RANGE_MM = 30      # closer than this = invalid
-MAX_RANGE_MM = 4000    # farther than this = invalid
-
-MOUNT_ANGLE_DEG = 0.0  # lidar turned on the car, + = turned left
-FLIP = False           # True if left/right is mirrored (check with the hand test)
-
-# joining points into lines
-LINE_GAP_MM = 50       # neighbours further apart than this (+ LINE_GAP_FRAC * range) start a new line
-LINE_GAP_FRAC = 0.05
-LINE_MIN_POINTS = 4    # fewer points than this stay single dots
-LINE_TOL_MM = 30       # a bend smaller than this is straightened out (bigger = fewer corners)
-
 STALE_S = 0.5          # no new scan for this long = NO DATA
 RETRY_S = 1.0          # wait before reconnecting
+GAP_FRAC = 0.05        # the gap setting grows by this much of the range, far points are further apart
+
+# settings, changed live from the menus in main.py:  name: [value, min, max, note]
+POINTS = {
+    "min_range": [30, 20, 1000, "mm, closer = invalid"],
+    "max_range": [4000, 500, 5600, "mm, farther = invalid"],
+    "fov": [240, 20, 240, "deg, scan window around ahead"],
+    "cluster": [1, 1, 8, "merge N steps into one point"],
+    "mount_angle": [0, -180, 180, "deg, lidar turned left = +"],
+    "flip": [0, 0, 1, "1 = left/right mirrored"],
+    "view_range": [4000, 500, 6000, "mm shown ahead (+ / - keys)"],
+}
+PLANES = {
+    "gap": [80, 10, 500, "mm, bigger jump = new object"],
+    "tolerance": [40, 5, 200, "mm, bend allowed in a plane"],
+    "min_points": [6, 2, 50, "fewer = no plane"],
+    "min_length": [150, 0, 2000, "mm, shorter = no plane"],
+    "shade": [1, 0, 1, "gray area behind planes"],
+}
 
 # fixed by the sensor
 FRONT_STEP = 384
+FIRST_STEP, LAST_STEP = 44, 725
 DEG_PER_STEP = 360 / 1024
 
-state = {"points": [], "lines": [], "time": None, "hz": 0.0, "last": 0.0, "error": "starting", "run": False}
+state = {"points": [], "planes": [], "time": None, "hz": 0.0, "last": 0.0, "error": "starting", "run": False}
 _thread = None
 
 
@@ -73,25 +76,43 @@ def nearest(lo_deg, hi_deg):
     return best
 
 
-def edges():
-    n = (END_STEP - START_STEP + 1) // CLUSTER
-    return _point(0, 1)[0], _point(n - 1, 1)[0]
+def _window():
+    # first step, last step and cluster of the scan, from the settings
+    half = int(POINTS["fov"][0] / 2 / DEG_PER_STEP)
+    return max(FIRST_STEP, FRONT_STEP - half), min(LAST_STEP, FRONT_STEP + half), POINTS["cluster"][0]
 
 
-def _point(n, d):
+def _point(n, d, start, cluster):
     # n-th point of a scan -> (angle_deg, range_mm), range 0 = invalid
-    if not MIN_RANGE_MM <= d <= MAX_RANGE_MM:
+    if not POINTS["min_range"][0] <= d <= POINTS["max_range"][0]:
         d = 0
-    step = START_STEP + n * CLUSTER + (CLUSTER - 1) / 2
+    step = start + n * cluster + (cluster - 1) / 2
     angle = (step - FRONT_STEP) * DEG_PER_STEP
-    if FLIP:
+    if POINTS["flip"][0]:
         angle = -angle
-    return (angle + MOUNT_ANGLE_DEG, d)
+    return (angle + POINTS["mount_angle"][0], d)
 
 
-def _rdp(pts, tol):
-    # keeps only the points that matter for the shape (Ramer-Douglas-Peucker), returns their indices
-    keep = {0, len(pts) - 1}
+# ---------------------------------------------------------------------------
+# planes: split the scan into objects at jumps, cut every object into straight pieces, fit a line to each
+# ---------------------------------------------------------------------------
+
+def _fit(pts):
+    # best straight line through the points -> centre x, y, direction x, y, biggest distance from the line
+    n = len(pts)
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    sxx = sum((p[0] - mx) ** 2 for p in pts)
+    syy = sum((p[1] - my) ** 2 for p in pts)
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in pts)
+    t = 0.5 * math.atan2(2 * sxy, sxx - syy)
+    dx, dy = math.cos(t), math.sin(t)
+    return mx, my, dx, dy, max(abs((p[1] - my) * dx - (p[0] - mx) * dy) for p in pts)
+
+
+def _split(pts, tol):
+    # cut where the points bend more than tol away from a straight line -> list of straight pieces
+    cuts = {0, len(pts) - 1}
     stack = [(0, len(pts) - 1)]
     while stack:
         i, j = stack.pop()
@@ -104,39 +125,67 @@ def _rdp(pts, tol):
             if d > far_d:
                 far, far_d = k, d
         if far is not None:
-            keep.add(far)
+            cuts.add(far)
             stack += [(i, far), (far, j)]
-    return sorted(keep)
+    cuts = sorted(cuts)
+    return [pts[i:j + 1] for i, j in zip(cuts, cuts[1:])]
 
 
-def find_lines(points):
-    # joins neighbouring points into lines. a gap or an invalid point ends a line
-    lines, cur, prev = [], [], None
+def _merge(pieces, tol):
+    # noise makes the split cut too often, join neighbours that are one straight line after all
+    out = [pieces[0]]
+    for piece in pieces[1:]:
+        both = out[-1] + piece[1:]
+        if _fit(both)[4] <= tol:
+            out[-1] = both
+        else:
+            out.append(piece)
+    return out
 
-    def close():
-        if len(cur) >= LINE_MIN_POINTS:
-            idx = _rdp([(p[2], p[3]) for p in cur], LINE_TOL_MM)
-            lines.append({"verts": [cur[i] for i in idx], "n": len(cur)})
 
+def find_planes(points):
+    gap, tol = PLANES["gap"][0], PLANES["tolerance"][0]
+    min_points, min_length = PLANES["min_points"][0], PLANES["min_length"][0]
+
+    # objects: neighbouring points that are close together
+    objects, cur = [], []
     for angle, r in points:
-        if not r:
-            close()
-            cur, prev = [], None
-            continue
-        a = math.radians(angle)
-        x, y = r * math.cos(a), r * math.sin(a)
-        if prev and math.hypot(x - prev[0], y - prev[1]) > LINE_GAP_MM + LINE_GAP_FRAC * r:
-            close()
+        if r:
+            a = math.radians(angle)
+            p = (r * math.cos(a), r * math.sin(a))
+            if cur and math.dist(p, cur[-1]) > gap + GAP_FRAC * r:
+                objects.append(cur)
+                cur = []
+            cur.append(p)
+        elif cur:
+            objects.append(cur)
             cur = []
-        cur.append((angle, r, x, y))
-        prev = (x, y)
-    close()
-    return lines
+    if cur:
+        objects.append(cur)
+
+    planes = []
+    for obj in objects:
+        if len(obj) < min_points:
+            continue
+        for pts in _merge(_split(obj, tol), tol):
+            if len(pts) < min_points:
+                continue
+            mx, my, dx, dy, _ = _fit(pts)
+            ends = []
+            for x, y in (pts[0], pts[-1]):    # the first and last point, moved onto the line
+                s = (x - mx) * dx + (y - my) * dy
+                ends.append((mx + s * dx, my + s * dy))
+            a, b = ends
+            if math.dist(a, b) >= min_length:
+                angle = math.degrees(math.atan2(dy, dx))
+                planes.append({"a": a, "b": b, "dist": abs(my * dx - mx * dy),
+                               "angle": (angle + 90) % 180 - 90, "n": len(pts)})
+    return planes
 
 
 def _publish(points):
     now = time.time()
-    state["lines"] = find_lines(points)
+    state["planes"] = find_planes(points)
     state["hz"] = 0.8 * state["hz"] + 0.2 / max(now - state["last"], 1e-3)
     state["last"] = now
     state["points"] = points
@@ -182,7 +231,8 @@ def init_sensor(ser):
 
 def read_scan(ser):
     # one scan: GD command with start step, end step, cluster. Returns [(angle_deg, range_mm), ...]
-    cmd = f"GD{START_STEP:04d}{END_STEP:04d}{CLUSTER:02d}"
+    start, end, cluster = _window()
+    cmd = f"GD{start:04d}{end:04d}{cluster:02d}"
     lines = command(ser, cmd)
     if len(lines) < 4 or lines[0] != cmd:
         raise ValueError("bad reply")
@@ -199,7 +249,7 @@ def read_scan(ser):
     points = []
     for i in range(0, len(data), 3):
         d = ((ord(data[i]) - 0x30) << 12) | ((ord(data[i + 1]) - 0x30) << 6) | (ord(data[i + 2]) - 0x30)
-        points.append(_point(i // 3, d))
+        points.append(_point(i // 3, d, start, cluster))
     return points
 
 
@@ -235,10 +285,11 @@ def _reader(port):
 def _sim_scan(t):
     # a small room with a box that drives around, for testing without the sensor
     ox, oy, rr = 1300 + 500 * math.sin(t * 0.6), 380 * math.sin(t * 0.9), 170
+    start, end, cluster = _window()
     points = []
-    for n in range((END_STEP - START_STEP + 1) // CLUSTER):
-        angle = _point(n, 1)[0] - MOUNT_ANGLE_DEG
-        a = math.radians(angle)
+    for n in range((end - start + 1) // cluster):
+        angle = _point(n, 1, start, cluster)[0]
+        a = math.radians((angle - POINTS["mount_angle"][0]) * (-1 if POINTS["flip"][0] else 1))
         dx, dy = math.cos(a), math.sin(a)
         hit = 1e9
         for wall, comp in ((3200 if dx > 0 else -600, dx), (1300 if dy > 0 else -1300, dy)):
@@ -248,7 +299,7 @@ def _sim_scan(t):
         disc = b * b - (ox * ox + oy * oy - rr * rr)
         if disc >= 0 and b - math.sqrt(disc) > 0:
             hit = min(hit, b - math.sqrt(disc))
-        points.append(_point(n, int(hit + random.gauss(0, 5))))
+        points.append(_point(n, int(hit + random.gauss(0, 5)), start, cluster))
     return points
 
 

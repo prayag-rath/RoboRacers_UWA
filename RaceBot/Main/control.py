@@ -1,11 +1,13 @@
 """control.py - ESC + steering servo over hardware pwm. Started by main.py.
 
 main.py calls  control.drive(forward, steer)  every frame, both -1..1.
-The car goes to neutral on exit, Ctrl+C, terminate and a closed terminal. Not on kill -9 or a freeze.
+The car goes to neutral on exit, Ctrl+C, terminate, a closed terminal and when main.py stops calling
+drive() (DEADMAN_S). Not on kill -9 or a frozen pi, and not when a key hangs because the vnc link dropped.
 """
 import atexit
 import os
 import signal
+import threading
 import time
 
 # configs
@@ -17,6 +19,7 @@ NEUTRAL_US = 1500      # servo center pulse
 ESC_NEUTRAL_US = 1500  # esc neutral pulse, must match calibrate.py
 RANGE_US = 500         # max pulse change
 ARM_TIME = 1           # s
+DEADMAN_S = 0.3        # no drive() call for this long = neutral
 
 STEER_SIGN = -1        # -1 if steering is reversed
 STEER_TRIM = 0.0       # tune center pos [-1,1]
@@ -28,7 +31,7 @@ STEER_START = 1.0      # steering factor at start
 STEER_STEP = 0.1       # change with left/right arrow
 
 state = {"throttle": 0.0, "steer": 0.0, "max_speed": SPEED_START, "steer_factor": STEER_START,
-         "motors": True, "armed": False}
+         "motors": True, "armed": False, "last": 0.0}
 
 
 def _write(ch, name, value):
@@ -43,6 +46,7 @@ def _pulse(ch, us):
 
 def drive(forward, steer):
     # forward / steer in -1..1
+    state["last"] = time.monotonic()
     state["throttle"] = forward * state["max_speed"]
     state["steer"] = steer * state["steer_factor"]
     _pulse(ESC_CH, ESC_NEUTRAL_US + state["throttle"] * RANGE_US)
@@ -55,6 +59,17 @@ def change_speed(direction):
 
 def change_steer(direction):
     state["steer_factor"] = max(STEER_STEP, min(1.0, round(state["steer_factor"] + direction * STEER_STEP, 1)))
+
+
+def _deadman():
+    # own thread: neutral if main.py stops calling drive(), for example when the window hangs
+    while state["armed"]:
+        time.sleep(DEADMAN_S / 3)
+        if time.monotonic() - state["last"] > DEADMAN_S and (state["throttle"] or state["steer"]):
+            try:
+                drive(0, 0)
+            except OSError:
+                pass
 
 
 def install_signals():
@@ -84,6 +99,7 @@ def start(no_motors=False):
     print("Starting ..." + ("" if state["motors"] else "  (no motors)"))
     time.sleep(ARM_TIME)
     state["armed"] = True
+    threading.Thread(target=_deadman, daemon=True).start()
     atexit.register(stop)
 
 

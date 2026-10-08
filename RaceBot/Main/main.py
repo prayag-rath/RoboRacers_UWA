@@ -1,14 +1,16 @@
-# starts lidar.py, vision.py and control.py and shows them in one window
+# starts lidar.py, vision.py and control.py and shows a camera panel and a lidar panel in one window
 # on the pi (vnc desktop):  python3 main.py
 # on a pc without hardware: python main.py --no-motors --sim --cam 0     (or --cam video.mp4)
 # other options:            --lidar /dev/ttyACM1    --no-lidar
-# keys: W/S A/D drive, up/down max speed, left/right steer factor, 1-8 pipeline step, L lock exposure,
-#       + / - lidar zoom, Esc quit
-# settings: click a box, type a number, Enter to set (Esc cancels). The car stops while you type
+# keys: W/S A/D drive, up/down max speed, left/right steer factor, 1-3 camera view,
+#       4 / 5 lidar points / planes on the camera, L lock exposure, + / - lidar zoom, Esc quit
+# settings: pick a menu, click a box, type a number, Enter to set (Esc cancels). A 0/1 box switches
+#       on click. The car stops while you type. Everything is kept in settings.json
 
 import argparse
+import json
 import math
-import time
+import os
 
 import cv2
 import numpy as np
@@ -20,21 +22,18 @@ import vision
 
 # configs
 FPS = 30
-RADAR_MM_PER_PX = 16.0     # lidar zoom at start
-RING_MM = 1000             # distance between the rings
-DOT = 2                    # point size in px
-LINE_W = 3                 # width of the lidar lines in px
-SHADE = "behind"           # solid area: "behind" = hidden area behind each line, "front" = free area in front, "none"
-WALL_H_MM = 300            # height of the walls drawn in the camera picture
-WALL_ALPHA = 110           # 0-255, how solid the walls are in the camera picture
+RING_MM = 1000             # distance between the rings in the lidar panel
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
 # layout
-PANEL_W, PANEL_H = 410, 380
+W, H = 1280, 650
+PANEL_W, PANEL_H = 625, 400
 TITLE_H = 24
-PANELS = [pygame.Rect(10 + i * 425, 10, PANEL_W, PANEL_H) for i in range(3)]   # vision, lidar, camera + lidar
-STEP_Y, STEP_H = 398, 28
-SET_Y, ROW_H, ROWS = 440, 36, 3
-W, H = 1280, 575
+PANELS = [pygame.Rect(10 + i * (PANEL_W + 10), 10, PANEL_W, PANEL_H) for i in range(2)]    # camera, lidar
+BTN_Y, BTN_W, BTN_H = 418, 125, 28    # buttons under the camera
+TAB_Y, TAB_W = 458, 150               # menu tabs
+SET_Y, ROW_H, ROWS, COL_W = 496, 36, 4, 285
+DRIVE_X = 890
 
 BG = (25, 25, 30)
 LINE = (70, 70, 80)
@@ -43,14 +42,63 @@ GRAY = (150, 150, 160)
 AMBER = (240, 200, 60)
 BLUE = (60, 110, 200)
 RED = (240, 80, 80)
-SHADE_COLOR = {"behind": (46, 46, 62), "front": (32, 48, 44)}
+GREEN = (90, 210, 120)     # lidar points
+SHADE = (50, 50, 60)       # area behind a plane
+RING = (60, 60, 72)
 
-ui = {"zoom": RADAR_MM_PER_PX, "editing": None, "typed": ""}
+MENUS = {"Camera": vision.SETTINGS, "Overlay": vision.OVERLAY,
+         "Lidar points": lidar.POINTS, "Lidar planes": lidar.PLANES}
+SAVED_UI = ("view", "points", "planes", "menu")
+
+ui = {"view": 0, "points": True, "planes": True, "menu": "Camera", "editing": None, "typed": ""}
 screen = font = small = None
 
 
-def text(s, pos, color=TEXT, f=None, anchor="topleft"):
-    img = (f or font).render(str(s), True, color)
+# ---------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------
+
+def set_value(items, key, value):
+    # keep the number inside its range
+    lo, hi = items[key][1:3]
+    try:
+        items[key][0] = min(hi, max(lo, int(value)))
+    except ValueError:
+        pass
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    for menu, items in MENUS.items():
+        for key, value in saved.get(menu, {}).items():
+            if key in items:
+                set_value(items, key, value)
+    for key in SAVED_UI:
+        ui[key] = saved.get("ui", {}).get(key, ui[key])
+    if ui["menu"] not in MENUS or ui["view"] not in range(len(vision.VIEWS)):
+        ui["menu"], ui["view"] = "Camera", 0
+
+
+def save_settings():
+    data = {menu: {key: item[0] for key, item in items.items()} for menu, items in MENUS.items()}
+    data["ui"] = {key: ui[key] for key in SAVED_UI}
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError as err:
+        print("could not save settings:", err)
+
+
+# ---------------------------------------------------------------------------
+# drawing helpers
+# ---------------------------------------------------------------------------
+
+def text(s, pos, color=TEXT, f=None, anchor="topleft", bg=None):
+    img = (f or font).render(str(s), True, color, bg)
     screen.blit(img, img.get_rect(**{anchor: pos}))
 
 
@@ -79,180 +127,131 @@ def show_image(img, area):
     screen.blit(pygame.image.frombuffer(view, area.size, "RGB"), area.topleft)
 
 
-def point_color(r):
-    # near = red, far = green
-    t = min(r / lidar.MAX_RANGE_MM, 1.0)
-    return (int(255 * (1 - t)), int(255 * t), 80)
+def buttons():
+    # every button: where, label, lit, and the ui value a click sets
+    out = [(i, BTN_Y, BTN_W, name, ui["view"] == i, "view", i) for i, name in enumerate(vision.VIEWS)]
+    out += [(3 + i, BTN_Y, BTN_W, "Lidar " + key, ui[key], key, not ui[key]) for i, key in enumerate(("points", "planes"))]
+    out += [(i, TAB_Y, TAB_W, name, ui["menu"] == name, "menu", name) for i, name in enumerate(MENUS)]
+    return [(pygame.Rect(10 + i * w, y, w - 4, BTN_H), label, lit, key, value)
+            for i, y, w, label, lit, key, value in out]
+
+
+def box_rect(i):
+    # number box of setting number i in the open menu
+    return pygame.Rect(10 + (i // ROWS) * COL_W + 115, SET_Y + (i % ROWS) * ROW_H, 60, 22)
 
 
 # ---------------------------------------------------------------------------
-# the three views
+# the two panels
 # ---------------------------------------------------------------------------
 
-def draw_vision(out):
-    step = vision.STEPS[vision.state["step"]]
-    area = panel(0, f"Vision - {step}   {vision.state['fps']:.0f} fps")
+def draw_camera(out):
+    view = vision.VIEWS[ui["view"]]
+    area = panel(0, f"Camera - {view}   {vision.state['fps']:.0f} fps")
     if out is None:
         text("No camera", area.center, GRAY, anchor="center")
-        text(vision.state["error"][:50], (area.centerx, area.centery + 24), RED, small, "midtop")
+        text(vision.state["error"][:60], (area.centerx, area.centery + 24), RED, small, "midtop")
         return
-    show_image(out["images"][step], area)
-    text(out["info"][step], (area.x + 6, area.y + 4), AMBER, small)
-
-
-def draw_radar():
-    pts = lidar.state["points"]
-    lines = lidar.state["lines"]
-    fresh = lidar.fresh()
-    valid = [(r, a) for a, r in pts if r] if fresh else []
-    title = f"Lidar   {lidar.state['hz']:.1f} Hz"
-    if valid:
-        r, a = min(valid)
-        title += f"   closest {r} mm at {a:+.0f} deg"
-    area = panel(1, title)
-
-    ox, oy = area.centerx, area.y + int(area.h * 0.62)    # lidar position
-    z = ui["zoom"]
-    origin = (ox, oy)
-
-    def to_px(angle, r_mm):
-        a = math.radians(angle)
-        return int(ox - r_mm * math.sin(a) / z), int(oy - r_mm * math.cos(a) / z)
-
-    screen.set_clip(area)
-
-    # solid area for every line, drawn first so rings and points stay visible on top
-    if fresh and SHADE != "none":
-        for seg in lines:
-            v = seg["verts"]
-            poly = [to_px(a, r) for a, r, _, _ in v]
-            if SHADE == "behind":    # from the line out to max range, along the same angles
-                a0, a1 = v[-1][0], v[0][0]
-                n = max(1, int(abs(a1 - a0) / 4))
-                poly += [to_px(a0 + (a1 - a0) * k / n, lidar.MAX_RANGE_MM) for k in range(n + 1)]
-            else:                    # from the lidar to the line
-                poly = [origin] + poly
-            pygame.draw.polygon(screen, SHADE_COLOR[SHADE], poly)
-
-    for r in range(RING_MM, lidar.MAX_RANGE_MM + 1, RING_MM):
-        radius = int(r / z)
-        pygame.draw.circle(screen, (60, 60, 72), origin, radius, 1)
-        text(f"{r / 1000:g} m", (ox + 4, oy - radius - 14), (110, 110, 120), small)
-    pygame.draw.line(screen, (70, 70, 80), origin, to_px(0, lidar.MAX_RANGE_MM), 1)
-    for a in lidar.edges():    # edges of the scan window, the rest is the blind sector
-        pygame.draw.line(screen, (90, 70, 40), origin, to_px(a, lidar.MAX_RANGE_MM), 1)
-
-    if fresh:
-        for a, r in pts:    # every point, small
-            if r:
-                pygame.draw.circle(screen, point_color(r), to_px(a, r), 1)
-        for seg in lines:   # joined into lines, colour = distance
-            v = seg["verts"]
-            for p, q in zip(v, v[1:]):
-                pygame.draw.line(screen, point_color((p[1] + q[1]) / 2), to_px(p[0], p[1]), to_px(q[0], q[1]), LINE_W)
-        if valid:
-            r, a = min(valid)
-            p = to_px(a, r)
-            pygame.draw.line(screen, (90, 90, 100), origin, p, 1)
-            pygame.draw.circle(screen, TEXT, p, 7, 1)
-    else:
-        text("NO DATA", (area.centerx, area.centery - 10), RED, anchor="center")
-        text(lidar.state["error"][:50], (area.centerx, area.centery + 10), RED, small, "midtop")
-    pygame.draw.polygon(screen, TEXT, [(ox, oy - 9), (ox - 6, oy + 6), (ox + 6, oy + 6)])
-    screen.set_clip(None)
-
-
-def draw_fusion(out):
-    pts = lidar.state["points"] if lidar.fresh() else []
-    lines = lidar.state["lines"] if lidar.fresh() else []
-    area = panel(2, "Camera + lidar")
-    pygame.draw.rect(screen, (0, 0, 0), area)
-    if out is None:
-        text("No camera", area.center, GRAY, anchor="center")
+    show_image(out["images"][view], area)
+    if not lidar.fresh():
+        text(out["info"], (area.x + 6, area.y + 4), AMBER, small, bg=BG)
         return
-    show_image(out["raw"], area)
+
+    # the lidar on top of the picture, at the height of the scan
     fh, fw = out["raw"].shape[:2]
     ox, oy, s = geom(fw, fh, area.size)
 
     def px(p):
-        return max(-30000, min(30000, int(ox + p[0] * s))), max(-30000, min(30000, int(oy + p[1] * s)))
+        return (max(-30000, min(30000, int(area.x + ox + p[0] * s))),
+                max(-30000, min(30000, int(area.y + oy + p[1] * s))))
 
-    ov = pygame.Surface(area.size, pygame.SRCALPHA)
-
-    # walls: every line is a wall standing on the ground, far ones first
-    for seg in sorted(lines, key=lambda g: -sum(p[1] for p in g["verts"]) / len(g["verts"])):
-        v = seg["verts"]
-        for p, q in zip(v, v[1:]):
-            quad = vision.wall_quad(p[2:], q[2:], fw, fh, WALL_H_MM)
-            if not quad:
-                continue
-            ga, gb, tb, ta, pa, pb = [px(c) for c in quad]
-            col = point_color((p[1] + q[1]) / 2)
-            pygame.draw.polygon(ov, col + (WALL_ALPHA,), [ga, gb, tb, ta])
-            pygame.draw.line(ov, col + (200,), ga, ta, 1)
-            pygame.draw.line(ov, col + (200,), gb, tb, 1)
-            pygame.draw.line(ov, col + (255,), pa, pb, LINE_W)
-
-    # the single points and the closest one
-    closest = None
-    for a, r in pts:
-        if r:
-            p = vision.project(a, r, fw, fh)
+    screen.set_clip(area)
+    if ui["planes"]:
+        for plane in lidar.state["planes"]:
+            ends = vision.project_line(plane["a"], plane["b"], fw, fh)
+            if ends:
+                pygame.draw.line(screen, AMBER, px(ends[0]), px(ends[1]), 3)
+    if ui["points"]:
+        for a, r in lidar.state["points"]:
+            p = vision.project(a, r, fw, fh) if r else None
             if p:
-                pygame.draw.circle(ov, point_color(r) + (255,), px(p), 1)
-                if closest is None or r < closest[0]:
-                    closest = (r, px(p))
-    if closest:
-        pygame.draw.circle(ov, TEXT + (255,), closest[1], 8, 1)
-        label = small.render(f"{closest[0] / 1000:.2f} m", True, TEXT)
-        ov.blit(label, (min(closest[1][0] + 12, area.w - label.get_width() - 4), max(closest[1][1] - 18, 4)))
+                pygame.draw.circle(screen, GREEN, px(p), 2)
+    screen.set_clip(None)
+    text(out["info"], (area.x + 6, area.y + 4), AMBER, small, bg=BG)
 
-    screen.blit(ov, area.topleft)
+
+def draw_lidar():
+    fresh = lidar.fresh()
+    points = lidar.state["points"] if fresh else []
+    planes = lidar.state["planes"] if fresh else []
+    title = f"Lidar   {lidar.state['hz']:.1f} Hz   {len(planes)} planes"
+    hit = lidar.nearest(-360, 360) if fresh else None
+    if hit:
+        title += f"   closest {hit[0]} mm at {hit[1]:+.0f} deg"
+    area = panel(1, title)
+
+    view = lidar.POINTS["view_range"][0]
+    ox, oy = area.centerx, area.y + int(area.h * 0.7)    # the car
+    z = view / (oy - area.y)                             # mm per px, view_range reaches the top
+
+    def xy(x, y):    # x ahead = up, y left = left
+        return int(ox - y / z), int(oy - x / z)
+
+    def polar(angle, r):
+        a = math.radians(angle)
+        return xy(r * math.cos(a), r * math.sin(a))
+
+    screen.set_clip(area)
+
+    # gray area behind every plane, first so the rest stays visible on top
+    if lidar.PLANES["shade"][0]:
+        for plane in planes:
+            a0 = math.degrees(math.atan2(plane["a"][1], plane["a"][0]))
+            a1 = math.degrees(math.atan2(plane["b"][1], plane["b"][0]))
+            span = (a1 - a0 + 180) % 360 - 180
+            n = max(1, int(abs(span) / 4))
+            arc = [polar(a0 + span * k / n, view * 2) for k in range(n, -1, -1)]    # outside the panel
+            pygame.draw.polygon(screen, SHADE, [xy(*plane["a"]), xy(*plane["b"])] + arc)
+
+    for r in range(RING_MM, int(view * 1.6), RING_MM):
+        pygame.draw.circle(screen, RING, (ox, oy), int(r / z), 1)
+        text(f"{r / 1000:g} m", (ox + 4, oy - int(r / z) - 14), (110, 110, 120), small)
+
+    for a, r in points:
+        if r:
+            pygame.draw.circle(screen, GREEN, polar(a, r), 1)
+    for plane in planes:
+        pygame.draw.line(screen, AMBER, xy(*plane["a"]), xy(*plane["b"]), 3)
+    if not fresh:
+        text("NO DATA", (area.centerx, area.centery - 10), RED, anchor="center")
+        text(lidar.state["error"][:60], (area.centerx, area.centery + 10), RED, small, "midtop")
+    pygame.draw.polygon(screen, TEXT, [(ox, oy - 9), (ox - 6, oy + 6), (ox + 6, oy + 6)])
+    screen.set_clip(None)
 
 
 # ---------------------------------------------------------------------------
-# steps, settings and drive info
+# buttons, menu and drive info
 # ---------------------------------------------------------------------------
-
-def field_pos(i):
-    # top left of setting number i
-    return 10 + (i // ROWS) * 425, SET_Y + (i % ROWS) * ROW_H
-
-
-def box_rect(i):
-    x, y = field_pos(i)
-    return pygame.Rect(x + 130, y, 70, 22)
-
 
 def draw_bottom():
-    step = vision.state["step"]
-    name = vision.STEPS[step]
+    for r, label, lit, _, _ in buttons():
+        pygame.draw.rect(screen, BLUE if lit else (45, 45, 55), r)
+        text(label, r.center, TEXT, small, "center")
 
-    # step bar
-    w = W // len(vision.STEPS)
-    for i, s in enumerate(vision.STEPS):
-        r = pygame.Rect(i * w, STEP_Y, w, STEP_H)
-        pygame.draw.rect(screen, BLUE if i == step else (45, 45, 55), r)
-        pygame.draw.rect(screen, BG, r, 1)
-        text(f"{i + 1} {s}", (r.x + 10, r.y + 7), TEXT, small)
-
-    # settings of this step: name, number box, range and note
-    items = vision.SETTINGS.get(name, {})
-    if not items:
-        text("no settings for this step", (10, SET_Y), GRAY, small)
-    for i, (key, (value, lo, hi, note)) in enumerate(items.items()):
-        x, y = field_pos(i)
+    # the open menu: name, number box, range and note
+    for i, (key, (value, lo, hi, note)) in enumerate(MENUS[ui["menu"]].items()):
         box = box_rect(i)
+        x = box.x - 115
         editing = ui["editing"] == key
         pygame.draw.rect(screen, AMBER if editing else LINE, box, 2)
-        text(key, (x, y + 3))
+        text(key, (x, box.y + 3))
         text(ui["typed"] + "_" if editing else value, (box.x + 6, box.y + 4))
-        text(f"{lo}-{hi}", (box.right + 10, y + 4), GRAY, small)
-        text(note, (x, y + 22), GRAY, small)
+        text(f"{lo}..{hi}", (box.right + 8, box.y + 4), GRAY, small)
+        text(note, (x, box.y + 22), GRAY, small)
 
     # drive info
     cs = control.state
-    x, y = 870, SET_Y
+    x, y = DRIVE_X, TAB_Y
     text("Throttle", (x, y))
     text("Steering", (x, y + 26))
     for k, v in enumerate((cs["throttle"] / control.SPEED_MAX, cs["steer"])):
@@ -272,7 +271,7 @@ def draw_bottom():
     elif not pygame.key.get_focused():
         text("window not active, no driving", (x, y + 110), AMBER, small)
     if vision.CAM_SOURCE == "picam":
-        text("exposure locked (L)" if vision.state["lock_ae"] else "exposure auto (L)", (x + 200, y + 110), GRAY, small)
+        text("exposure locked (L)" if vision.state["lock_ae"] else "exposure auto (L)", (x, y + 132), GRAY, small)
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +280,7 @@ def draw_bottom():
 
 def handle(e):
     # returns False to quit
-    name = vision.STEPS[vision.state["step"]]
-    items = vision.SETTINGS.get(name, {})
+    items = MENUS[ui["menu"]]
 
     if e.type == pygame.QUIT:
         return False
@@ -290,14 +288,14 @@ def handle(e):
     # typing a number into a setting
     if e.type == pygame.KEYDOWN and ui["editing"]:
         if e.key == pygame.K_RETURN:
-            if ui["typed"]:
-                vision.set_value(name, ui["editing"], ui["typed"])
+            set_value(items, ui["editing"], ui["typed"])
+            save_settings()
             ui["editing"] = None
         elif e.key == pygame.K_ESCAPE:
             ui["editing"] = None
         elif e.key == pygame.K_BACKSPACE:
             ui["typed"] = ui["typed"][:-1]
-        elif e.unicode.isdigit() and len(ui["typed"]) < 5:
+        elif (e.unicode.isdigit() or (e.unicode == "-" and not ui["typed"])) and len(ui["typed"]) < 5:
             ui["typed"] += e.unicode
 
     # key functions
@@ -313,23 +311,33 @@ def handle(e):
         elif e.key == pygame.K_LEFT:
             control.change_steer(-1)
         elif e.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
-            ui["zoom"] = max(4.0, ui["zoom"] / 1.25)
+            set_value(lidar.POINTS, "view_range", lidar.POINTS["view_range"][0] / 1.25)
+            save_settings()
         elif e.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
-            ui["zoom"] = min(40.0, ui["zoom"] * 1.25)
-        elif pygame.K_1 <= e.key < pygame.K_1 + len(vision.STEPS):
-            vision.state["step"] = e.key - pygame.K_1
+            set_value(lidar.POINTS, "view_range", lidar.POINTS["view_range"][0] * 1.25)
+            save_settings()
+        elif pygame.K_1 <= e.key <= pygame.K_5:    # the five buttons under the camera
+            key, value = buttons()[e.key - pygame.K_1][3:]
+            ui[key] = value
+            save_settings()
         elif e.key == pygame.K_l and vision.CAM_SOURCE == "picam":
             vision.state["lock_ae"] = not vision.state["lock_ae"]
 
-    # click a step or a setting
+    # click a button or a setting
     elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
         ui["editing"] = None
-        w = W // len(vision.STEPS)
-        if STEP_Y <= e.pos[1] < STEP_Y + STEP_H:
-            vision.state["step"] = min(e.pos[0] // w, len(vision.STEPS) - 1)
-        for i, key in enumerate(items):
+        for r, _, _, key, value in buttons():
+            if r.collidepoint(e.pos):
+                ui[key] = value
+                save_settings()
+                return True
+        for i, (key, (value, lo, hi, _)) in enumerate(items.items()):
             if box_rect(i).collidepoint(e.pos):
-                ui["editing"], ui["typed"] = key, ""
+                if (lo, hi) == (0, 1):
+                    set_value(items, key, 1 - value)
+                    save_settings()
+                else:
+                    ui["editing"], ui["typed"] = key, ""
     return True
 
 
@@ -343,6 +351,8 @@ def main(argv=None):
     ap.add_argument("--sim", action="store_true", help="simulated lidar (pc testing)")
     ap.add_argument("--no-lidar", action="store_true", help="run without lidar")
     args = ap.parse_args(argv)
+
+    load_settings()
 
     # start the other files, lidar and vision run in their own threads
     if args.no_lidar:
@@ -374,11 +384,9 @@ def main(argv=None):
                 fwd = steer = 0
             control.drive(fwd, steer)
 
-            out = vision.state["out"]
             screen.fill(BG)
-            draw_vision(out)
-            draw_radar()
-            draw_fusion(out)
+            draw_camera(vision.state["out"])
+            draw_lidar()
             draw_bottom()
             pygame.display.flip()
             clock.tick(FPS)
@@ -387,10 +395,6 @@ def main(argv=None):
         vision.stop()
         lidar.stop()
         pygame.quit()
-
-        # final settings, paste into the SETTINGS block in vision.py
-        for step, items in vision.SETTINGS.items():
-            print(step, {k: v[0] for k, v in items.items()})
 
 
 if __name__ == "__main__":

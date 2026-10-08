@@ -1,11 +1,11 @@
 """vision.py - camera + pipeline (own thread). Started by main.py.
 
-pipeline: raw -> crop -> blur -> gray -> threshold -> clean -> contours -> result
-each step works on the output of the step before, and has its own settings.
+pipeline: crop -> blur -> threshold -> clean -> contours
+main.py shows one of three views of it: Raw, Threshold, Contours.
 
 Shared with the other files:
-    state["out"]   latest result: raw frame, image + info text per step, contours, line centre
-    project(...), wall_quad(...)   lidar point / wall piece -> pixels in the camera picture (fusion view)
+    state["out"]   latest result: raw frame, a picture per view, info text, line centre and offset
+    project(...), project_line(...)   lidar point / plane -> pixels in the camera picture
 
 Standalone use is not needed, run main.py.
 """
@@ -21,44 +21,44 @@ CAM_SOURCE = "picam"   # "picam", a camera number (0) or a video file
 CAM_SIZE = (640, 480)  # capture size
 CAM_FPS = 15           # camera + pipeline rate
 
-# geometry for the lidar overlay, measure these on the car (mm / deg)
-CAM_HFOV_DEG = 62.2    # horizontal field of view: pi camera v2 = 62, v3 = 66, v3 wide = 102
-CAM_PITCH_DEG = 0.0    # + = camera looks down
-CAM_HEIGHT_MM = 150    # camera height above the ground
-LIDAR_HEIGHT_MM = 90   # lidar scan plane height above the ground
-CAM_FWD_MM = 0         # camera position relative to the lidar, + = ahead
-CAM_LEFT_MM = 0        # + = left of the lidar
-
 MASK = "gray"    # "gray" = gray + threshold, "hsv" = colour range (for coloured tape)
+NEAR_MM = 120    # parts of a plane closer than this to the camera are cut off
 
-STEPS = ["Raw", "Crop", "Blur", "Gray", "Threshold", "Clean", "Contours", "Result"]
+VIEWS = ["Raw", "Threshold", "Contours"]
 
-# settings per step:  name: [value, min, max, note]
-# min-max is the recommended range, typed values are kept inside it
+# settings, changed live from the menus in main.py:  name: [value, min, max, note]
 SETTINGS = {
-    "Crop": {"keep_bottom": [60, 10, 100, "% of the image height"]},
-    "Blur": {"kernel": [5, 1, 15, "odd numbers, 1 = off"]},
-    "Clean": {"kernel": [3, 0, 15, "0 = off"]},
-    "Contours": {"min_area": [200, 0, 5000, "px, smaller is ignored"]},
+    "keep_bottom": [60, 10, 100, "% of the image height"],
+    "blur": [5, 1, 15, "kernel, 1 = off"],
+    "clean": [3, 0, 15, "kernel, 0 = off"],
+    "min_area": [200, 0, 5000, "px, smaller is ignored"],
 }
-
 if MASK == "gray":
-    SETTINGS["Threshold"] = {
-        "value": [127, 0, 255, "ignored when otsu = 1"],
-        "invert": [0, 0, 1, "1 = dark things become white"],
-        "otsu": [0, 0, 1, "1 = automatic value"],
-    }
+    SETTINGS.update({
+        "threshold": [127, 0, 255, "ignored when otsu = 1"],
+        "invert": [0, 0, 1, "1 = dark things are white"],
+        "otsu": [0, 0, 1, "1 = automatic threshold"],
+    })
 else:
-    SETTINGS["Threshold"] = {
+    SETTINGS.update({
         "h_min": [20, 0, 179, "yellow is about 20-35"],
-        "h_max": [35, 0, 179, "if below h_min: wraps (red)"],
+        "h_max": [35, 0, 179, "below h_min: wraps (red)"],
         "s_min": [100, 0, 255, ""],
         "s_max": [255, 0, 255, ""],
         "v_min": [100, 0, 255, ""],
         "v_max": [255, 0, 255, ""],
-    }
+    })
 
-state = {"step": 7, "lock_ae": False, "run": False, "out": None, "fps": 0.0, "error": ""}
+# where the camera sits, for the lidar overlay. Measure on the car, then tune until the dots fit
+OVERLAY = {
+    "cam_hfov": [62, 30, 160, "deg, v2 = 62, v3 = 66, wide = 102"],
+    "cam_pitch": [0, -45, 45, "deg, + = camera looks down"],
+    "cam_above": [60, -300, 500, "mm above the lidar scan"],
+    "cam_fwd": [0, -300, 300, "mm ahead of the lidar"],
+    "cam_left": [0, -300, 300, "mm left of the lidar"],
+}
+
+state = {"lock_ae": False, "run": False, "out": None, "fps": 0.0, "error": ""}
 _cam = None
 _thread = None
 
@@ -67,152 +67,116 @@ _thread = None
 # pipeline
 # ---------------------------------------------------------------------------
 
-def val(step, name):
-    return SETTINGS[step][name][0]
-
-
-def set_value(step, name, text):
-    # keep the typed number inside the range, make it odd if needed
-    _, lo, hi, note = SETTINGS[step][name]
-    value = min(hi, max(lo, int(text)))
-    if "odd" in note and value % 2 == 0:
-        value += 1
-    SETTINGS[step][name][0] = value
+def val(name):
+    return SETTINGS[name][0]
 
 
 def to_bgr(gray):
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
-def gray_mask(gray):
-    flag = cv2.THRESH_BINARY_INV if val("Threshold", "invert") else cv2.THRESH_BINARY
-    if val("Threshold", "otsu"):
+def gray_mask(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    flag = cv2.THRESH_BINARY_INV if val("invert") else cv2.THRESH_BINARY
+    if val("otsu"):
         flag |= cv2.THRESH_OTSU
-    thr, mask = cv2.threshold(gray, val("Threshold", "value"), 255, flag)
+    thr, mask = cv2.threshold(gray, val("threshold"), 255, flag)
     return mask, f"threshold {thr:.0f}"
 
 
 def hsv_mask(img):
-    t = {name: item[0] for name, item in SETTINGS["Threshold"].items()}
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lo = (t["h_min"], t["s_min"], t["v_min"])
-    hi = (t["h_max"], t["s_max"], t["v_max"])
-    if t["h_min"] <= t["h_max"]:
+    lo = (val("h_min"), val("s_min"), val("v_min"))
+    hi = (val("h_max"), val("s_max"), val("v_max"))
+    if lo[0] <= hi[0]:
         mask = cv2.inRange(hsv, lo, hi)
     else:
         # hue wraps around 179 -> 0
-        m1 = cv2.inRange(hsv, lo, (179, t["s_max"], t["v_max"]))
-        m2 = cv2.inRange(hsv, (0, t["s_min"], t["v_min"]), hi)
-        mask = m1 | m2
-    return mask, f"{100 * cv2.countNonZero(mask) / mask.size:.1f}% of pixels in range"
+        mask = cv2.inRange(hsv, lo, (179, hi[1], hi[2])) | cv2.inRange(hsv, (0, lo[1], lo[2]), hi)
+    return mask, f"{100 * cv2.countNonZero(mask) / mask.size:.1f}% in range"
 
 
 def run(img):
-    # img is bgr. returns the picture and an info text for every step, plus extras for the fusion view
-    images = {}
-    info = {step: "" for step in STEPS}
-
-    images["Raw"] = img
+    # img is bgr. returns a picture per view, all the size of img so the lidar overlay fits on each
+    h, w = img.shape[:2]
 
     # crop: keep the bottom part (the track), drop the horizon
-    top = int(img.shape[0] * (100 - val("Crop", "keep_bottom")) / 100)
+    top = min(h - 1, int(h * (100 - val("keep_bottom")) / 100))
     crop = img[top:]
-    images["Crop"] = crop
 
-    k = val("Blur", "kernel")
+    k = val("blur") | 1    # the kernel must be odd
     blur = cv2.GaussianBlur(crop, (k, k), 0) if k > 1 else crop
-    images["Blur"] = blur
 
-    gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
-    images["Gray"] = to_bgr(gray)
-
-    if MASK == "gray":
-        mask, info["Threshold"] = gray_mask(gray)
-    else:
-        mask, info["Threshold"] = hsv_mask(blur)
-    images["Threshold"] = to_bgr(mask)
+    mask, info = gray_mask(blur) if MASK == "gray" else hsv_mask(blur)
 
     # clean: remove small specks (open), fill small holes (close)
-    k = val("Clean", "kernel")
+    k = val("clean")
     if k > 0:
         kernel = np.ones((k, k), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    images["Clean"] = to_bgr(mask)
 
     found, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    found = [c for c in found if cv2.contourArea(c) >= val("Contours", "min_area")]
+    found = [c + np.array([0, top], np.int32) for c in found if cv2.contourArea(c) >= val("min_area")]
+    info += f"   {len(found)} contours"
 
-    shape = to_bgr(mask)
-    cv2.drawContours(shape, found, -1, (0, 255, 0), 2)
-    images["Contours"] = shape
-    info["Contours"] = f"{len(found)} contours"
+    full = np.zeros((h, w), np.uint8)
+    full[top:] = mask
+    threshold = to_bgr(full)
 
-    # result: colour picture with the contours on top
-    result = crop.copy()
-    cv2.drawContours(result, found, -1, (0, 255, 0), 2)
-    info["Result"] = f"{len(found)} contours"
+    contours = img.copy()
+    cv2.drawContours(contours, found, -1, (0, 255, 0), 2)
+    for view in (threshold, contours):    # above this line nothing is looked at
+        cv2.line(view, (0, top), (w, top), (120, 120, 120), 1)
+
+    # centre of the biggest contour, offset = px from the image centre, + = right
     center, offset = None, None
     if found:
-        big = max(found, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(big)
-        cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 255), 2)
-        m = cv2.moments(big)
+        m = cv2.moments(max(found, key=cv2.contourArea))
         if m["m00"] > 0:
-            cx = int(m["m10"] / m["m00"])
-            cy = int(m["m01"] / m["m00"])
-            cv2.circle(result, (cx, cy), 6, (0, 0, 255), -1)
-            offset = cx - crop.shape[1] // 2    # px from the image centre, + = right
-            center = (cx, cy + top)
-            info["Result"] += f"   biggest {cv2.contourArea(big):.0f}px   offset {offset:+d}px"
-    images["Result"] = result
+            center = (int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"]))
+            offset = center[0] - w // 2
+            cv2.circle(contours, center, 6, (0, 0, 255), -1)
+            info += f"   offset {offset:+d} px"
 
-    # the same contours in full-picture coordinates, for the fusion view
-    shift = np.array([0, top], np.int32)
-    extras = {"contours": [c + shift for c in found], "center": center, "offset": offset, "top": top}
-    return images, info, extras
+    images = {"Raw": img, "Threshold": threshold, "Contours": contours}
+    return {"raw": img, "images": images, "info": info, "center": center, "offset": offset}
 
 
 # ---------------------------------------------------------------------------
-# lidar -> camera
+# lidar -> camera. Everything is drawn at the height of the lidar scan
 # ---------------------------------------------------------------------------
 
-def project_xy(x, y, w, h, z_mm=None):
+def _depth(x):
+    # how far ahead of the camera a point is, x = ahead of the lidar
+    p = math.radians(OVERLAY["cam_pitch"][0])
+    return (x - OVERLAY["cam_fwd"][0]) * math.cos(p) + OVERLAY["cam_above"][0] * math.sin(p)
+
+
+def project_xy(x, y, w, h):
     """Pixel in a w x h camera picture for a point in lidar coordinates (x ahead, y left, mm),
-    or None if it is behind the camera. z_mm = height above the ground (default: the lidar scan plane)."""
-    z = LIDAR_HEIGHT_MM if z_mm is None else z_mm
-    x -= CAM_FWD_MM                              # ahead of the camera
-    y -= CAM_LEFT_MM                             # left of the camera
-    up = z - CAM_HEIGHT_MM                       # above the camera
-    p = math.radians(CAM_PITCH_DEG)
+    or None if it is behind the camera."""
+    x -= OVERLAY["cam_fwd"][0]                   # ahead of the camera
+    y -= OVERLAY["cam_left"][0]                  # left of the camera
+    up = -OVERLAY["cam_above"][0]                # above the camera
+    p = math.radians(OVERLAY["cam_pitch"][0])
     depth = x * math.cos(p) - up * math.sin(p)   # along the viewing direction
     vert = x * math.sin(p) + up * math.cos(p)
     if depth < 50:
         return None
-    f = (w / 2) / math.tan(math.radians(CAM_HFOV_DEG) / 2)
+    f = (w / 2) / math.tan(math.radians(OVERLAY["cam_hfov"][0]) / 2)
     return w / 2 - f * y / depth, h / 2 - f * vert / depth
 
 
-def project(angle_deg, r_mm, w, h, z_mm=None):
+def project(angle_deg, r_mm, w, h):
     # same for a lidar point given as angle + range
     a = math.radians(angle_deg)
-    return project_xy(r_mm * math.cos(a), r_mm * math.sin(a), w, h, z_mm)
+    return project_xy(r_mm * math.cos(a), r_mm * math.sin(a), w, h)
 
 
-NEAR_MM = 120    # parts of a wall closer than this to the camera plane are cut off
-
-
-def _depth(x, z_mm):
-    up = z_mm - CAM_HEIGHT_MM
-    p = math.radians(CAM_PITCH_DEG)
-    return (x - CAM_FWD_MM) * math.cos(p) - up * math.sin(p)
-
-
-def wall_quad(a, b, w, h, top_mm):
-    """A piece of wall between two lidar points a, b = (x, y) standing on the ground up to top_mm.
-    Returns pixels (ground a, ground b, top b, top a, scan plane a, scan plane b) or None if not visible.
-    A straight wall stays straight in the picture, so the two end points are enough."""
-    d0, d1 = _depth(a[0], LIDAR_HEIGHT_MM), _depth(b[0], LIDAR_HEIGHT_MM)
+def project_line(a, b, w, h):
+    # a plane from the lidar, a, b = (x, y) -> its two end pixels, or None if it is behind the camera
+    d0, d1 = _depth(a[0]), _depth(b[0])
     if d0 < NEAR_MM and d1 < NEAR_MM:
         return None
     if d0 < NEAR_MM:        # cut the part behind the camera
@@ -221,10 +185,8 @@ def wall_quad(a, b, w, h, top_mm):
     elif d1 < NEAR_MM:
         t = (NEAR_MM - d1) / (d0 - d1)
         b = (b[0] + (a[0] - b[0]) * t, b[1] + (a[1] - b[1]) * t)
-    pts = [project_xy(a[0], a[1], w, h, 0), project_xy(b[0], b[1], w, h, 0),
-           project_xy(b[0], b[1], w, h, top_mm), project_xy(a[0], a[1], w, h, top_mm),
-           project_xy(a[0], a[1], w, h), project_xy(b[0], b[1], w, h)]
-    return pts if all(pts) else None
+    ends = project_xy(a[0], a[1], w, h), project_xy(b[0], b[1], w, h)
+    return ends if all(ends) else None
 
 
 # ---------------------------------------------------------------------------
@@ -287,14 +249,12 @@ def _loop():
             time.sleep(0.1)
             continue
         try:
-            images, info, extras = run(img)
-            state["out"] = {"raw": img, "images": images, "info": info, **extras}
+            state["out"] = run(img)
             state["error"] = ""
         except Exception as err:    # keep going while settings are being changed
             state["error"] = str(err)
-            state["out"] = {"raw": img, "images": {s: img for s in STEPS},
-                            "info": {s: f"error: {err}" for s in STEPS},
-                            "contours": [], "center": None, "offset": None, "top": 0}
+            state["out"] = {"raw": img, "images": {v: img for v in VIEWS}, "info": f"error: {err}",
+                            "center": None, "offset": None}
 
         time.sleep(max(0, 1 / CAM_FPS - (time.time() - t0)))
         now = time.time()
