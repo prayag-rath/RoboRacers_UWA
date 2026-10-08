@@ -12,6 +12,7 @@ passwords:
 2) VNC IP : 172.20.10.4:1
 3) tiger VNC : racecar
 4) User pi : rasp
+5) IP PI: pi@10.42.0.1
 
 Devices in use:
 1) Lidar : Hokuyo URG-04LX-UG01
