@@ -9,16 +9,16 @@ https://roboracer.ai/rules
 3) https://lnkd.in/p/gtw2csNt
 
 # Important
-1) WiFi AP fallback SSID : RacebotPi 
+1) WiFi AP fallback SSID : RacebotPi <br>
    WiFi AP fallback password: racecar123
-2) VNC IP : 10.42.0.1 (AP fallback)
-   VNC IP : 172.20.10.4 (Guags iphone)
-   VNC IP : 10.146.106.227 (donga_mobile)
+2) VNC IP : 10.42.0.1 (AP fallback) <br>
+   VNC IP : 172.20.10.4 (Guags iphone) <br>
+   VNC IP : 10.146.106.227 (donga_mobile) <br>
    VNC password : racecar
-4) User : pi 
+4) User : pi <br>
    Password : rasp
-5) Dashboard 0 : Touchscreen
-   Dashboard 1/2 : VNC dashboards
+5) Dashboard 0 : Touchscreen <br>
+   Dashboard 1/2 : VNC dashboards 
 
 # Modules
 1) Lidar : Hokuyo URG-04LX-UG01
