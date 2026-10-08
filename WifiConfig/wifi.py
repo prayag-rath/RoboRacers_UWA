@@ -150,7 +150,7 @@ def show(nets):
         print(f"{i:>2}  {'on ' if n['on'] else 'off'}  {n['ssid']}{mark(n['ssid'])}")
     print(f"    ap   {AP_CONN} (after {AP_AFTER_S} s without wifi){mark(AP_CONN)}")
     ours = [n["ssid"] for n in nets] + [AP_CONN]
-    other = [p for p in profiles() if p not in ours]
+    other = [p + (" (connected)" if p in up else "") for p in profiles() if p not in ours]
     if other:
         print("\nsaved in NetworkManager but not in networks.txt: " + ", ".join(other))
 

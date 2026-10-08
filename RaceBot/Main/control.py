@@ -45,7 +45,9 @@ def _pulse(ch, us):
 
 
 def drive(forward, steer):
-    # forward / steer in -1..1
+    # forward / steer in -1..1 (+ = forward / right), bigger values are cut off
+    forward = max(-1, min(1, forward))
+    steer = max(-1, min(1, steer))
     state["last"] = time.monotonic()
     state["throttle"] = forward * state["max_speed"]
     state["steer"] = steer * state["steer_factor"]

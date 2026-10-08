@@ -2,14 +2,16 @@
 
 The sensor is fixed at 10 scans/s and 0.3516 deg per step, only the settings below can be changed.
 
-Everything the other files need is in `state` plus a few helpers:
-    state["points"]  [(angle_deg, range_mm), ...]   angle 0 = ahead, + = left, range 0 = invalid
-    state["planes"]  straight walls / object sides found in the scan:
+Functions for the other files (all give nothing when the scans have stopped):
+    points()         [(angle_deg, range_mm), ...]   angle 0 = ahead, + = left, only valid points
+    planes()         straight walls / object sides found in the scan:
                      [{"a": (x, y), "b": (x, y), "dist": mm, "angle": deg, "n": points}, ...]
                      x = ahead, y = left (mm). a, b = the two ends, dist = from the lidar to the plane,
                      angle = direction of the plane, 0 = along the car, +-90 = across
+    nearest(lo, hi)  closest point between two angles -> (range_mm, angle_deg) or None
+    scan_count()     goes up by one for every new scan
     fresh()          True while scans keep arriving
-    nearest(lo, hi)  closest valid point between two angles -> (range_mm, angle_deg) or None
+state["points"] is the raw scan, where range 0 = invalid.
 
 Standalone check:  python3 lidar.py [/dev/ttyACM1]     (prints the closest point)
 Needs pyserial:    sudo apt install python3-serial
@@ -56,7 +58,8 @@ FRONT_STEP = 384
 FIRST_STEP, LAST_STEP = 44, 725
 DEG_PER_STEP = 360 / 1024
 
-state = {"points": [], "planes": [], "time": None, "hz": 0.0, "last": 0.0, "error": "starting", "run": False}
+state = {"points": [], "planes": [], "count": 0, "time": None, "hz": 0.0, "last": 0.0,
+         "error": "starting", "run": False}
 _thread = None
 
 
@@ -68,12 +71,24 @@ def fresh():
     return state["time"] is not None and time.time() - state["time"] < STALE_S
 
 
+def points():
+    return [p for p in state["points"] if p[1]] if fresh() else []
+
+
+def planes():
+    return state["planes"] if fresh() else []
+
+
 def nearest(lo_deg, hi_deg):
     best = None
-    for a, r in state["points"]:
-        if r and lo_deg <= a <= hi_deg and (best is None or r < best[0]):
+    for a, r in points():
+        if lo_deg <= a <= hi_deg and (best is None or r < best[0]):
             best = (r, a)
     return best
+
+
+def scan_count():
+    return state["count"]
 
 
 def _window():
@@ -190,6 +205,7 @@ def _publish(points):
     state["last"] = now
     state["points"] = points
     state["time"] = now
+    state["count"] += 1
 
 
 # ---------------------------------------------------------------------------

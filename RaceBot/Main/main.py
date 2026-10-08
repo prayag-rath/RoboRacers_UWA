@@ -1,9 +1,10 @@
 # starts lidar.py, vision.py and control.py and shows a camera panel and a lidar panel in one window
 # on the pi (vnc desktop):  python3 main.py
 # on a pc without hardware: python main.py --no-motors --sim --cam 0     (or --cam video.mp4)
-# other options:            --lidar /dev/ttyACM1    --no-lidar
-# keys: W/S A/D drive, up/down max speed, left/right steer factor, 1-3 camera view,
-#       4 / 5 lidar points / planes on the camera, L lock exposure, + / - lidar zoom, Esc quit
+# other options:            --lidar /dev/ttyACM1    --no-lidar    --no-dash
+# on the pi the touch display shows one view at a time, with buttons to switch (dashboard.py)
+# keys: W/S A/D drive, Space auto on/off (pilot.py drives), up/down max speed, left/right steer factor,
+#       1-3 camera view, 4 / 5 lidar points / planes on the camera, L lock exposure, + / - lidar zoom, Esc quit
 # settings: pick a menu, click a box, type a number, Enter to set (Esc cancels). A 0/1 box switches
 #       on click. The car stops while you type. Everything is kept in settings.json
 
@@ -11,18 +12,29 @@ import argparse
 import json
 import math
 import os
+import subprocess
+import sys
+import threading
+import time
+import traceback
 
 import cv2
 import numpy as np
 import pygame
 
 import control
+import dashboard
 import lidar
+import pilot    # the driving algorithm. Another one:  import my_pilot as pilot
 import vision
 
 # configs
 FPS = 30
 RING_MM = 1000             # distance between the rings in the lidar panel
+STOP_MM = 300              # auto: no forward driving with something closer than this ahead, 0 = off
+STOP_DEG = 20              # auto: "ahead" is this many degrees to each side
+DASH_FPS = 10              # pictures per second to the touch display
+DASH_BTN_H = 44            # height of the buttons on the touch display
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
 # layout
@@ -50,7 +62,10 @@ MENUS = {"Camera": vision.SETTINGS, "Overlay": vision.OVERLAY,
          "Lidar points": lidar.POINTS, "Lidar planes": lidar.PLANES}
 SAVED_UI = ("view", "points", "planes", "menu")
 
-ui = {"view": 0, "points": True, "planes": True, "menu": "Camera", "editing": None, "typed": ""}
+ui = {"view": 0, "points": True, "planes": True, "menu": "Camera", "editing": None, "typed": "",
+      "auto": False, "blocked": False}    # auto = pilot.py drives, blocked = it is held back
+dash = {"proc": None, "size": None, "surface": None, "frame": None, "taps": [],
+        "view": 2, "points": True}    # view: 0-2 = the camera views, 3 = radar
 screen = font = small = None
 
 
@@ -148,6 +163,11 @@ def box_rect(i):
 def draw_camera(out):
     view = vision.VIEWS[ui["view"]]
     area = panel(0, f"Camera - {view}   {vision.state['fps']:.0f} fps")
+    camera_view(out, area, view, ui["points"], ui["planes"])
+
+
+def camera_view(out, area, view, show_points, show_planes):
+    # the camera picture with the lidar on top, used by the main window and the dashboard
     if out is None:
         text("No camera", area.center, GRAY, anchor="center")
         text(vision.state["error"][:60], (area.centerx, area.centery + 24), RED, small, "midtop")
@@ -166,12 +186,12 @@ def draw_camera(out):
                 max(-30000, min(30000, int(area.y + oy + p[1] * s))))
 
     screen.set_clip(area)
-    if ui["planes"]:
+    if show_planes:
         for plane in lidar.state["planes"]:
             ends = vision.project_line(plane["a"], plane["b"], fw, fh)
             if ends:
                 pygame.draw.line(screen, AMBER, px(ends[0]), px(ends[1]), 3)
-    if ui["points"]:
+    if show_points:
         for a, r in lidar.state["points"]:
             p = vision.project(a, r, fw, fh) if r else None
             if p:
@@ -181,14 +201,18 @@ def draw_camera(out):
 
 
 def draw_lidar():
+    title = f"Lidar   {lidar.state['hz']:.1f} Hz   {len(lidar.state['planes'])} planes"
+    hit = lidar.nearest(-360, 360) if lidar.fresh() else None
+    if hit:
+        title += f"   closest {hit[0]} mm at {hit[1]:+.0f} deg"
+    lidar_view(panel(1, title))
+
+
+def lidar_view(area):
+    # the radar, used by the main window and the dashboard
     fresh = lidar.fresh()
     points = lidar.state["points"] if fresh else []
     planes = lidar.state["planes"] if fresh else []
-    title = f"Lidar   {lidar.state['hz']:.1f} Hz   {len(planes)} planes"
-    hit = lidar.nearest(-360, 360) if fresh else None
-    if hit:
-        title += f"   closest {hit[0]} mm at {hit[1]:+.0f} deg"
-    area = panel(1, title)
 
     view = lidar.POINTS["view_range"][0]
     ox, oy = area.centerx, area.y + int(area.h * 0.7)    # the car
@@ -227,6 +251,81 @@ def draw_lidar():
         text(lidar.state["error"][:60], (area.centerx, area.centery + 10), RED, small, "midtop")
     pygame.draw.polygon(screen, TEXT, [(ox, oy - 9), (ox - 6, oy + 6), (ox + 6, oy + 6)])
     screen.set_clip(None)
+
+
+# ---------------------------------------------------------------------------
+# dashboard on the touch display: one view at a time and a row of buttons. dashboard.py shows it
+# ---------------------------------------------------------------------------
+
+def start_dash():
+    dash["proc"] = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(SETTINGS_FILE), "dashboard.py")],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    threading.Thread(target=_dash_read, daemon=True).start()
+    threading.Thread(target=_dash_send, daemon=True).start()
+
+
+def _dash_read():
+    # the dashboard prints its size first, then one line per tap
+    for line in dash["proc"].stdout:
+        try:
+            x, y = map(int, line.split())
+        except ValueError:
+            continue
+        if dash["size"] is None:
+            dash["size"] = (x, y)
+        else:
+            dash["taps"].append((x, y))
+
+
+def _dash_send():
+    # own thread, so a slow touch display never holds up the driving
+    try:
+        while dash["proc"].poll() is None:
+            time.sleep(1 / DASH_FPS)
+            frame, dash["frame"] = dash["frame"], None
+            if frame:
+                dash["proc"].stdin.write(frame)
+                dash["proc"].stdin.flush()
+    except (OSError, ValueError):
+        pass
+    dash["size"] = None    # the dashboard is gone, stop drawing it
+
+
+def draw_dash(out):
+    global screen
+    if dash["size"] is None or dash["frame"]:    # no dashboard, or the last picture is not sent yet
+        return
+    w, h = dash["size"]
+    if dash["surface"] is None:
+        dash["surface"] = pygame.Surface((w, h))
+    labels = vision.VIEWS + ["Radar", "Points"]
+    rects = [pygame.Rect(i * w // len(labels), h - DASH_BTN_H, w // len(labels) - 2, DASH_BTN_H)
+             for i in range(len(labels))]
+
+    while dash["taps"]:
+        pos = dash["taps"].pop(0)
+        for i, r in enumerate(rects):
+            if r.collidepoint(pos):
+                if labels[i] == "Points":
+                    dash["points"] = not dash["points"]
+                else:
+                    dash["view"] = i
+
+    window, screen = screen, dash["surface"]    # the draw functions draw on `screen`
+    try:
+        screen.fill(BG)
+        area = pygame.Rect(0, 0, w, h - DASH_BTN_H - 2)
+        if dash["view"] < len(vision.VIEWS):
+            camera_view(out, area, vision.VIEWS[dash["view"]], dash["points"], ui["planes"])
+        else:
+            lidar_view(area)
+        for i, r in enumerate(rects):
+            lit = dash["points"] if labels[i] == "Points" else dash["view"] == i
+            pygame.draw.rect(screen, BLUE if lit else (45, 45, 55), r)
+            text(labels[i], r.center, anchor="center")
+    finally:
+        screen = window
+    dash["frame"] = pygame.image.tobytes(dash["surface"], "RGB")
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +371,27 @@ def draw_bottom():
         text("window not active, no driving", (x, y + 110), AMBER, small)
     if vision.CAM_SOURCE == "picam":
         text("exposure locked (L)" if vision.state["lock_ae"] else "exposure auto (L)", (x, y + 132), GRAY, small)
+    if ui["blocked"]:
+        text("AUTO held back: obstacle or no lidar", (x, y + 154), RED)
+    elif ui["auto"]:
+        text("AUTO  (Space or a drive key = stop)", (x, y + 154), GREEN)
+    else:
+        text("manual  (Space = auto)", (x, y + 154), GRAY)
+
+
+def auto_drive():
+    # what pilot.py wants, checked before it goes to the car
+    try:
+        fwd, steer = pilot.step()
+    except Exception:    # a bug in the algorithm: show it and go back to manual
+        traceback.print_exc()
+        ui["auto"] = False
+        return 0, 0
+    hit = lidar.nearest(-STOP_DEG, STOP_DEG)
+    ui["blocked"] = bool(STOP_MM) and fwd > 0 and (not lidar.fresh() or (hit is not None and hit[0] < STOP_MM))
+    if ui["blocked"]:
+        fwd = 0
+    return fwd, steer
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +422,8 @@ def handle(e):
     elif e.type == pygame.KEYDOWN:
         if e.key == pygame.K_ESCAPE:
             return False
+        elif e.key == pygame.K_SPACE:
+            ui["auto"] = not ui["auto"]
         elif e.key == pygame.K_UP:
             control.change_speed(+1)
         elif e.key == pygame.K_DOWN:
@@ -350,6 +472,7 @@ def main(argv=None):
     ap.add_argument("--lidar", default=None, help=f"lidar port (default {lidar.PORT})")
     ap.add_argument("--sim", action="store_true", help="simulated lidar (pc testing)")
     ap.add_argument("--no-lidar", action="store_true", help="run without lidar")
+    ap.add_argument("--no-dash", action="store_true", help="nothing on the touch display")
     args = ap.parse_args(argv)
 
     load_settings()
@@ -370,6 +493,11 @@ def main(argv=None):
     small = pygame.font.SysFont(None, 20)
     clock = pygame.time.Clock()
 
+    # the touch display is another x display than this window. Not there on a pc, or when this runs on it
+    here = os.environ.get("DISPLAY", dashboard.DISPLAY).split(".")[0]
+    if not args.no_dash and here != dashboard.DISPLAY:
+        start_dash()
+
     running = True
     try:
         while running:
@@ -382,16 +510,27 @@ def main(argv=None):
             steer = keys[pygame.K_d] - keys[pygame.K_a]
             if not pygame.key.get_focused() or ui["editing"]:
                 fwd = steer = 0
+                ui["auto"] = False
+            if fwd or steer:    # a drive key takes over from the pilot
+                ui["auto"] = False
+            if ui["auto"]:
+                fwd, steer = auto_drive()
+            else:
+                ui["blocked"] = False
             control.drive(fwd, steer)
 
+            out = vision.state["out"]
             screen.fill(BG)
-            draw_camera(vision.state["out"])
+            draw_camera(out)
             draw_lidar()
             draw_bottom()
+            draw_dash(out)
             pygame.display.flip()
             clock.tick(FPS)
     finally:
         control.stop()    # neutral first
+        if dash["proc"]:
+            dash["proc"].terminate()
         vision.stop()
         lidar.stop()
         pygame.quit()

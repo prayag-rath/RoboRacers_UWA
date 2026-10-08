@@ -3,9 +3,11 @@
 pipeline: crop -> blur -> threshold -> clean -> contours
 main.py shows one of three views of it: Raw, Threshold, Contours.
 
-Shared with the other files:
-    state["out"]   latest result: raw frame, a picture per view, info text, line centre and offset
+Functions for the other files:
+    frame()         latest camera picture (bgr), or None when there is no camera
+    line_offset()   px from the picture centre to the centre of the biggest contour, + = right, or None
     project(...), project_line(...)   lidar point / plane -> pixels in the camera picture
+state["out"] is the full latest result: raw frame, a picture per view, info text, line centre and offset.
 
 Standalone use is not needed, run main.py.
 """
@@ -61,6 +63,18 @@ OVERLAY = {
 state = {"lock_ae": False, "run": False, "out": None, "fps": 0.0, "error": ""}
 _cam = None
 _thread = None
+
+
+# ---------------------------------------------------------------------------
+# functions for the other files
+# ---------------------------------------------------------------------------
+
+def frame():
+    return state["out"]["raw"] if state["out"] else None
+
+
+def line_offset():
+    return state["out"]["offset"] if state["out"] else None
 
 
 # ---------------------------------------------------------------------------
