@@ -1,0 +1,40 @@
+{
+  "Camera": {
+    "keep_bottom": 100,
+    "blur": 1,
+    "clean": 3,
+    "min_area": 200,
+    "threshold": 127,
+    "invert": 0,
+    "otsu": 0
+  },
+  "Overlay": {
+    "cam_hfov": 62,
+    "cam_pitch": 0,
+    "cam_above": 60,
+    "cam_fwd": 0,
+    "cam_left": 0
+  },
+  "Lidar points": {
+    "min_range": 30,
+    "max_range": 4000,
+    "fov": 180,
+    "cluster": 1,
+    "mount_angle": 0,
+    "flip": 0,
+    "view_range": 4000
+  },
+  "Lidar planes": {
+    "gap": 80,
+    "tolerance": 40,
+    "min_points": 6,
+    "min_length": 150,
+    "shade": 1
+  },
+  "ui": {
+    "view": 2,
+    "points": true,
+    "planes": true,
+    "menu": "Lidar planes"
+  }
+}
